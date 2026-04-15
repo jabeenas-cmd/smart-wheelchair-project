@@ -1,0 +1,368 @@
+// ==========================================
+// BLYNK & WIFI CONFIGURATION (Must be at top)
+// ==========================================
+#define BLYNK_TEMPLATE_ID "TMPL3L5cPvFFM"       // Replace with your ID
+#define BLYNK_TEMPLATE_NAME "wheelchair" // Replace with your Name
+#define BLYNK_AUTH_TOKEN "QyKslJEOJOrffybXm_toW1sAiOW_LxWj"      // Replace with your Token
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+char ssid[] = "Lilac";
+char pass[] = "248248248";
+
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+// Motors (L293D)
+#define IN1 27
+#define IN2 26
+#define IN3 25
+#define IN4 33
+
+#define buzzer 32  
+// Ultrasonic Front
+#define TRIG_FRONT 5
+#define ECHO_FRONT 18
+
+// Ultrasonic Back
+#define TRIG_BACK 19 
+#define ECHO_BACK 23
+
+// Voice Module (Serial2 Default)
+#define RX2_PIN 16
+#define TX2_PIN 17
+
+// ==========================================
+// CONSTANTS & GLOBALS
+// ==========================================
+const int DISTANCE_THRESHOLD = 20; // cm
+
+// System States
+enum Direction { STOPPED, FORWARD, BACKWARD, LEFT, RIGHT };
+volatile Direction currentDir = STOPPED;
+volatile bool voiceActive = false; // Arbitration flag: Voice > Gestures
+
+// Notification Cooldown
+unsigned long lastNotifyTime = 0; 
+
+// MPU6050
+MPU6050 mpu;
+int16_t ax, ay, az;
+int16_t ax_off, ay_off, az_off;
+
+// Front Sensor
+volatile long startFront, endFront;
+volatile bool echoFlagFront = false;
+volatile bool obstacleFront = false;
+
+// Back Sensor
+volatile long startBack, endBack;
+volatile bool echoFlagBack = false;
+volatile bool obstacleBack = false;
+
+// RTOS Task Handles
+TaskHandle_t TaskVoice_Handle;
+TaskHandle_t TaskObstacle_Handle;
+TaskHandle_t TaskGesture_Handle;
+TaskHandle_t TaskBlynk_Handle;
+
+// ==========================================
+// HARDWARE INTERRUPTS (ISRs)
+// ==========================================
+void IRAM_ATTR echoFrontISR() {
+  if (digitalRead(ECHO_FRONT) == HIGH) startFront = micros();
+  else { endFront = micros(); echoFlagFront = true; }
+}
+
+void IRAM_ATTR echoBackISR() {
+  if (digitalRead(ECHO_BACK) == HIGH) startBack = micros();
+  else { endBack = micros(); echoFlagBack = true; }
+}
+
+// Function Prototypes
+void calibrateMPU();
+void moveForward();
+void moveBackward();
+void turnLeft();
+void turnRight();
+void stopMotors();
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200); 
+  Serial2.begin(9600, SERIAL_8N1, RX2_PIN, TX2_PIN); // VC-02
+
+  // Pin Modes
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_BACK, OUTPUT);  pinMode(ECHO_BACK, INPUT);
+
+  pinMode(buzzer, OUTPUT);
+  // Attach Interrupts
+  attachInterrupt(digitalPinToInterrupt(ECHO_FRONT), echoFrontISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_BACK), echoBackISR, CHANGE);
+  
+  digitalWrite(buzzer, LOW);
+  // Initialize I2C & MPU6050
+  Wire.begin(21, 22);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 failed. Check wiring.");
+    while (1) { vTaskDelay(10); } 
+  }
+  calibrateMPU();
+  
+  // Ensure motors are off at boot
+  stopMotors();
+  Serial.println("System Ready - Initializing WiFi and RTOS Tasks...");
+  WiFi.begin(ssid, pass);
+  while(WiFi.status()!=WL_CONNECTED)
+  {
+    Serial.print("..");
+  }
+  Serial.println("Conncetd");
+
+  // Initialize Blynk (Blocking until connected initially, or you can use WiFi.begin for custom non-blocking)
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("Blynk Conncetd");
+
+  // --- Task Creation ---
+  // Core 1, Priority 4 (HIGHEST): Emergency Stop & Voice Control
+  xTaskCreatePinnedToCore(TaskVoice, "VoiceTask", 4096, NULL, 4, &TaskVoice_Handle, 1);
+  
+  // Core 0, Priority 3: Dual Obstacle Detection
+  xTaskCreatePinnedToCore(TaskObstacle, "ObstacleTask", 4096, NULL, 3, &TaskObstacle_Handle, 0);
+
+  // Core 0, Priority 2: Blynk Background Task
+  xTaskCreatePinnedToCore(TaskBlynk, "BlynkTask", 8192, NULL, 2, &TaskBlynk_Handle, 0);
+  
+  // Core 1, Priority 1 (LOWEST): Continuous Gesture Polling
+  xTaskCreatePinnedToCore(TaskGesture, "GestureTask", 4096, NULL, 1, &TaskGesture_Handle, 1);
+}
+
+void loop() {
+  vTaskDelete(NULL); // Loop is not needed in RTOS
+}
+
+// ==========================================
+// RTOS TASKS
+// ==========================================
+
+// Task 1: Blynk Connection Manager (Core 0)
+void TaskBlynk(void *pvParameters) {
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!Blynk.connected()) {
+        Blynk.connect(); // Attempt to reconnect if lost
+        Serial.println("Connecting.....");
+      } else {
+        Blynk.run();     // Process incoming/outgoing Blynk data
+      }
+    }
+    // Yield to the Obstacle task
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+}
+
+// Task 2: Voice Commands (Highest Priority - Core 1)
+void TaskVoice(void *pvParameters) {
+  unsigned int receivedvalue = 0;
+  for (;;) {
+    while (Serial2.available()) {
+      byte high = Serial2.read();
+      byte low = Serial2.read();
+      receivedvalue = (high << 8) | low;
+      
+      // PRIORITY 1: Emergency Stop
+      if (receivedvalue == 0xAA11 || receivedvalue == 0xBB22) { 
+        Serial.println("VOICE COMMAND: STOP!");
+        stopMotors();
+        if(receivedvalue == 0xBB22){
+        // Push notification to Blynk (with 10-sec cooldown)
+        if (millis() - lastNotifyTime > 10000) {
+          Blynk.logEvent("emergency"); 
+          lastNotifyTime = millis();
+        }
+        }
+        voiceActive = false; // Release control back to Gestures
+        // Flush buffer
+        while(Serial2.available()) Serial2.read(); 
+      } 
+      // Normal Voice Commands
+      else if (receivedvalue == 0xA189) { voiceActive = true; Serial.println("VOICE COMMAND: Forward");moveForward();   }
+      else if (receivedvalue == 0xA191) { voiceActive = true;Serial.println("VOICE COMMAND: Backward"); moveBackward(); }
+      else if (receivedvalue == 0xA020) { voiceActive = true; Serial.println("VOICE COMMAND: Left");turnLeft();      }
+      else if (receivedvalue == 0xA030) { voiceActive = true; Serial.println("VOICE COMMAND: Right");turnRight();     }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5)); 
+  }
+}
+
+// Task 3: Obstacle Detection (Core 0)
+void TaskObstacle(void *pvParameters) {
+  float distFront = 100.0, distBack = 100.0;
+  unsigned long lastGaugeUpdate = 0;
+  
+  for (;;) {
+    // 1. Ping Front Sensor
+    digitalWrite(TRIG_FRONT, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG_FRONT, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIG_FRONT, LOW);
+    
+    vTaskDelay(pdMS_TO_TICKS(30)); 
+    
+    if (echoFlagFront) {
+      distFront = (endFront - startFront) * 0.034 / 2;
+      echoFlagFront = false;
+      obstacleFront = (distFront > 0 && distFront < DISTANCE_THRESHOLD);
+    }
+
+    // 2. Ping Back Sensor
+    digitalWrite(TRIG_BACK, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG_BACK, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIG_BACK, LOW);
+    
+    vTaskDelay(pdMS_TO_TICKS(30)); 
+    
+    if (echoFlagBack) {
+      distBack = (endBack - startBack) * 0.034 / 2;
+      echoFlagBack = false;
+      obstacleBack = (distBack > 0 && distBack < DISTANCE_THRESHOLD);
+    }
+// Send data to Blynk every 500ms
+    // Send data to Blynk every 500ms
+    if (millis() - lastGaugeUpdate > 500) {
+      // V1 for Front Distance, V2 for Back Distance
+      Blynk.virtualWrite(V1, distFront); 
+      Blynk.virtualWrite(V2, distBack);
+      
+      // Determine string based on current direction
+      String dirString = "Stopped";
+      if (currentDir == FORWARD) dirString = "Forward";
+      else if (currentDir == BACKWARD) dirString = "Backward";
+      else if (currentDir == LEFT) dirString = "Left";
+      else if (currentDir == RIGHT) dirString = "Right";
+      
+      // Send Current Direction to V0
+      Blynk.virtualWrite(V0, dirString);
+      
+      lastGaugeUpdate = millis(); // Reset the timer
+    }
+    // --- BUZZER LOGIC ---
+    if (obstacleFront || obstacleBack) {
+      digitalWrite(buzzer, HIGH); // Sound buzzer if obstacle detected
+    } else {
+      digitalWrite(buzzer, LOW);  // Turn off if path is clear
+    }
+    // 3. Dynamic Stop Logic
+    if (obstacleFront && (currentDir == FORWARD || currentDir == LEFT || currentDir == RIGHT)) {
+      Serial.println("ALERT: FRONT OBSTACLE! Stopping Motion");
+      stopMotors();
+    }
+    if (obstacleBack && currentDir == BACKWARD) {
+      Serial.println("ALERT: REAR OBSTACLE! Stopping Motion");
+      stopMotors();
+    }
+  }
+}
+
+// Task 4: Gestures (Core 1)
+void TaskGesture(void *pvParameters) {
+  int ax_map, ay_map;
+  for (;;) {
+    // Only process if Voice hasn't taken over
+    if (!voiceActive) {
+      mpu.getAcceleration(&ax, &ay, &az);
+      ax -= ax_off; ay -= ay_off;
+
+      ax_map = map(constrain(ax, -16384, 16384), -16384, 16384, 0, 1000);
+      ay_map = map(constrain(ay, -16384, 16384), -16384, 16384, 0, 1000);
+
+      if (ax_map > 650 && ax_map < 850) {
+        if (!obstacleFront){ Serial.println("GESTURE COMMAND: Forward");moveForward();}
+      } else if (ax_map < 150 && ax_map < 350) { 
+        if (!obstacleBack){Serial.println("GESTURE COMMAND: Backward"); moveBackward();}
+      } else if (ay_map > 650 && ay_map < 850) {
+        if (!obstacleFront) {Serial.println("GESTURE COMMAND: LEFT");turnLeft();}
+      } else if (ay_map < 150 && ay_map < 350) { 
+        if (!obstacleFront) {Serial.println("GESTURE COMMAND: Right");turnRight();}
+      } else {
+        Serial.println("GESTURE COMMAND: STOP");
+        stopMotors();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100)); // Poll 10x a second
+  }
+}
+
+// ==========================================
+// MOTOR CONTROL & INTERLOCKS
+// ==========================================
+void moveForward() {
+  if (obstacleFront) return; 
+  if (currentDir != FORWARD) {
+    Serial.println("MOTOR Action: Forward");
+    currentDir = FORWARD;
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+}
+
+void moveBackward() {
+  if (obstacleBack) return;
+  if (currentDir != BACKWARD) {
+    Serial.println("MOTOR Action: Backward"); 
+    currentDir = BACKWARD;
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  }
+}
+
+void turnLeft() {
+  if (obstacleFront) return; 
+  if (currentDir != LEFT) {
+    Serial.println("MOTOR Action: Left");
+    currentDir = LEFT;
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+}
+
+void turnRight() {
+  if (obstacleFront) return;
+  if (currentDir != RIGHT) {
+    Serial.println("MOTOR Action: Right");
+    currentDir = RIGHT;
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  }
+}
+
+void stopMotors() {
+  if (currentDir != STOPPED) {
+    currentDir = STOPPED;
+    Serial.println("MOTOR Action: !!!STOP!!!");
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  }
+}
+
+// ==========================================
+// CALIBRATION
+// ==========================================
+void calibrateMPU() {
+  long ax_s = 0, ay_s = 0, az_s = 0;
+  for (int i = 0; i < 100; i++) {
+    mpu.getAcceleration(&ax, &ay, &az);
+    ax_s += ax; ay_s += ay; az_s += az;
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  ax_off = ax_s / 100; ay_off = ay_s / 100; az_off = (az_s / 100) - 16384;
+}
