@@ -138,7 +138,11 @@ This ensures:
 - Elderly care systems  
 
 ---
+## 🎥 Demo Video
 
+[Watch Demo](https://drive.google.com/file/d/17x3XsEjV_uyxbOpw5bTjLP_GDwFlu4_s/view?usp=drivesdk)
+
+---
 ## 👩‍💻 Developed By
 **Jabeena Shaik**  
 B.Tech – Electronics & Communication Engineering  
