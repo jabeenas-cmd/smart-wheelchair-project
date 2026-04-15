@@ -11,8 +11,8 @@
 #include <Wire.h>
 #include <MPU6050.h>
 
-char ssid[] = "Lilac";
-char pass[] = "248248248";
+char ssid[] = "WIFI_NAME";
+char pass[] = "PASSWORD";
 
 // ==========================================
 // PIN DEFINITIONS
